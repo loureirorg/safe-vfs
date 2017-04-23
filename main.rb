@@ -162,27 +162,27 @@ class SafeVFS
     return nil
   end
 
-  # def rename(from_path, to_path)
-  #   puts "rename: #{from_path}, #{to_path}"
-  #
-  #   # remove "/private" or "/public": it doesn't matter
-  #   folders = from_path.split('/')
-  #   folders.shift # blank
-  #   folders.shift # private or public
-  #   from_path = ([''] + folders).join('/')
-  #
-  #   # remove "/private" or "/public": it doesn't matter
-  #   folders = to_path.split('/')
-  #   folders.shift # blank
-  #   folders.shift # private or public
-  #   name = folders.pop # file name
-  #   to_path = ([''] + folders).join('/')
-  #
-  #   puts "#{from_path}, #{name}"
-  #
-  #   # puts @safe.nfs.move_file('drive', to_path, 'drive', from_path, 'copy')
-  #   puts @safe.nfs.rename_file(from_path, name, root_path: 'drive')
-  # end
+  def rename(from_path, to_path)
+    # remove "/private" or "/public": it doesn't matter
+    folders = from_path.split('/')
+    folders.shift # blank
+    priv_pub_from = folders.shift # private or public
+    name_from = folders.pop # file name
+    folders << name_from
+    from_path = ([''] + folders).join('/')
+
+    # remove "/private" or "/public": it doesn't matter
+    folders = to_path.split('/')
+    folders.shift # blank
+    priv_pub_to = folders.shift # private or public
+    name_to = folders.pop # file name
+    to_path = ([''] + folders).join('/')
+
+    raise Errno::EBADF if priv_pub_from != priv_pub_to # move from priv to pub: not implemented yet
+
+    @safe.nfs.move_file('drive', from_path, 'drive', to_path, 'move')
+    @safe.nfs.update_file_meta([to_path, name_from].join('/'), root_path: 'drive', name: name_to) if name_to != name_from
+  end
 
   def touch(path, modtime)
     folders = path.split('/')
@@ -206,12 +206,16 @@ class SafeVFS
     file = get_file_entry(path)
     file = get_folder_entry(path) if ! file
     return [0, 0, 0] if ! file
-    # raise Errno::ENOENT if ! file
+
+    begin
     [
       DateTime.rfc3339(file['modifiedOn']).to_time.to_i,
       DateTime.rfc3339(file['modifiedOn']).to_time.to_i,
       DateTime.rfc3339(file['createdOn']).to_time.to_i
     ]
+    rescue
+      return [0, 0, 0]
+    end
   end
 
   def directory?(path)
@@ -385,6 +389,7 @@ class SafeVFS
       # invalidates cache
       entries = raw[:root_is_public] ? $cached_public.find_folder(raw[:path]) : $cached_private.find_folder(raw[:path])
       entries[:valid] = false
+      contents("/#{raw[:root_is_public] ? 'public' : 'private'}#{raw[:path]}")
     end
 
     if raw[:tmp_hnd]
