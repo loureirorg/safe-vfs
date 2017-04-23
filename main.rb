@@ -403,4 +403,4 @@ end
 safe_vfs = SafeVFS.new
 # safe_vfs.contents('/')
 # FuseFS.start(safe_vfs, '/mnt/test')
-FuseFS.mount() { |opt| safe_vfs }
+FuseFS.main() { |opt| safe_vfs }
