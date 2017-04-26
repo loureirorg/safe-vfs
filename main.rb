@@ -549,5 +549,5 @@ end
 
 safe_vfs = SafeVFS.new
 # safe_vfs.contents('/')
-FuseFS.start(safe_vfs, '/mnt/test')
-# FuseFS.main() { |opt| safe_vfs }
+# FuseFS.start(safe_vfs, '/mnt/test')
+FuseFS.main() { |opt| safe_vfs }
