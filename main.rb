@@ -438,6 +438,7 @@ class SafeVFS
     raise Errno::EPERM if (root_type == 'outside') && ['w', 'rw', 'a'].include?(mode)
 
     # long_name, service_name
+    domain_items = []
     if root_type == 'outside'
       domain = folders.shift
       domain_items = domain.split('.')
