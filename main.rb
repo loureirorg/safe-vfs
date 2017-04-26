@@ -65,62 +65,116 @@ class SafeVFS
     # Keeps the structure in cache for speed up
     #   Cache is only used to display time/size/directory?/file?
     #   ls/cat DO NOT use cache
-    @enable_cache   = true
     $cached_private = CacheTree.new
     $cached_public  = CacheTree.new
+    $cached_alien   = CacheTree.new
 
     @safe = SafeNet::Client.new({
       name: 'SAFE Virtual FS',
-      version: '0.0.1',
+      version: '0.1.0',
       vendor: 'Daniel Loureiro',
       id: 'safe-vfs',
       permissions: ['SAFE_DRIVE_ACCESS']
     })
+
+    @safe.nfs.delete_file('settings.json', root_path: 'app', is_private: true)
+    @settings = @safe.nfs.get_file('settings.json', root_path: 'app', is_private: true)['body']
+    if @settings.nil?
+      default_structure = {
+        alien_items: []
+      }
+      @safe.nfs.create_file('settings.json', default_structure.to_json, root_path: 'app', is_private: true)
+      @settings = @safe.nfs.get_file('settings.json', root_path: 'app', is_private: true)['body']
+    end
+    @settings = JSON.parse(@settings)
   end
 
   def contents(path)
     folders = path.split('/')
     folders.shift # 1st item is always blank
     if folders.empty? # path == '/'
-      return ['public', 'private']
+      return ['public', 'private', 'outside']
     end
 
-    root_is_public = (folders.shift == 'public')
+    root_type = folders.shift # public / private / outside
     path = '/' + folders.join('/') # relative to /public or /private
+    path.squeeze!('/')
 
-    # Safe DOESN'T have a /public and a /private folders,
-    #  instead all private and public items are mixed together on root.
-    #  For a /public  emulation, it checks on "/" for isPrivate=false items
-    #  For a /private emulation, it checks on "/" for isPrivate=true  items
-    safe_res = @safe.nfs.get_directory(path, root_path: 'drive')
+    if root_type == 'outside'
+      if folders.empty? # root, ie. "ls /outside"
+        return @settings["alien_items"]
 
-    # invalidates cache
-    cache = $cached_private.find_folder(path)
-    cache[:folders] = {}
-    cache[:files] = {}
-    cache = $cached_public.find_folder(path)
-    cache[:folders] = {}
-    cache[:files] = {}
+      else # "ls /outside/www.something"
+        folders.shift if folders.first == ''
+        if folders.length == 1
+          domain_items = folders.pop.split('.')
+          raise Errno::EBADF if domain_items.length != 2 # invalid format. It should be "<service_name>.<long_name>"
 
-    # files
-    safe_res['files'].each do |item|
-      cache = item['isPrivate'] ? $cached_private : $cached_public
-      cache.put(true, path, item['name'], item)
+          # invalidates cache
+          cache = $cached_alien.find_folder(path)
+          cache[:folders] = {}
+          cache[:files] = {}
+
+          # list of files/dirs
+          safe_res = @safe.dns.get_home_dir(domain_items[1], domain_items[0])
+
+          # files
+          safe_res['files'].each do |item|
+            $cached_alien.put(true, path, item['name'], item)
+          end
+
+          # folders
+          safe_res['subDirectories'].each do |item|
+            $cached_alien.put(false, path, item['name'], item)
+          end
+
+          # validates cache
+          $cached_alien.find_folder(path)[:valid]  = true
+
+          # returns list of files / directories
+          entries = $cached_alien.find_folder(path)
+          return (entries[:folders].values + entries[:files].values).map {|i| i['name']}
+        else
+          raise Errno::EPERM # we cannot read subfolders
+        end
+      end
+    else
+      root_is_public = (root_type == 'public')
+
+      # Safe DOESN'T have a /public and a /private folders,
+      #  instead all private and public items are mixed together on root.
+      #  For a /public  emulation, it checks on "/" for isPrivate=false items
+      #  For a /private emulation, it checks on "/" for isPrivate=true  items
+      safe_res = @safe.nfs.get_directory(path, root_path: 'drive')
+
+      # invalidates cache
+      cache = $cached_private.find_folder(path)
+      cache[:folders] = {}
+      cache[:files] = {}
+      cache = $cached_public.find_folder(path)
+      cache[:folders] = {}
+      cache[:files] = {}
+
+      # files
+      safe_res['files'].each do |item|
+        cache = item['isPrivate'] ? $cached_private : $cached_public
+        cache.put(true, path, item['name'], item)
+      end
+
+      # folders
+      safe_res['subDirectories'].each do |item|
+        cache = item['isPrivate'] ? $cached_private : $cached_public
+        cache.put(false, path, item['name'], item)
+      end
+
+      # validates cache
+      $cached_private.find_folder(path)[:valid] = true
+      $cached_public.find_folder(path)[:valid]  = true
+
+      # returns list of files / directories
+      entries = root_is_public ? $cached_public.find_folder(path) : $cached_private.find_folder(path)
+      (entries[:folders].values + entries[:files].values).map {|i| i['name']}
     end
-
-    # folders
-    safe_res['subDirectories'].each do |item|
-      cache = item['isPrivate'] ? $cached_private : $cached_public
-      cache.put(false, path, item['name'], item)
-    end
-
-    # validates cache
-    $cached_private.find_folder(path)[:valid] = true
-    $cached_public.find_folder(path)[:valid]  = true
-
-    # returns list of files / directories
-    entries = root_is_public ? $cached_public.find_folder(path) : $cached_private.find_folder(path)
-    (entries[:folders].values + entries[:files].values).map {|i| i['name']}
   end
 
   def get_entries(path)
@@ -129,14 +183,21 @@ class SafeVFS
     name = folders.pop
     return false if folders.empty? # /, /public, /private
 
-    root_is_public = (folders.shift == 'public')
+    root_type = folders.shift
     path = '/' + folders.join('/') # relative to /public or /private
 
     # Cache
-    entries = root_is_public ? $cached_public.find_folder(path) : $cached_private.find_folder(path)
+    cached = case root_type
+    when 'public' then $cached_public
+    when 'private' then $cached_private
+    when 'outside' then $cached_alien
+    else raise Errno::EBADF
+    end
+
+    entries = cached.find_folder(path)
     if ! entries[:valid]
-      contents("/#{root_is_public ? 'public' : 'private'}/#{path}")
-      entries = root_is_public ? $cached_public.find_folder(path) : $cached_private.find_folder(path)
+      contents("/#{root_type}/#{path}")
+      entries = cached.find_folder(path)
     end
     hash_name = Digest::SHA2.new(256).hexdigest(name)
     {name: name, hash_name: hash_name, path: path, entries: entries}
@@ -187,14 +248,16 @@ class SafeVFS
   def touch(path, modtime)
     folders = path.split('/')
     folders.shift # remove blank
-    root_is_public = (folders.shift == 'public')
+    root_type = folders.shift
     path = '/' + folders.join('/') # relative to /public or /private
+
+    raise Errno::EPERM if (root_type != 'private') || (root_type != 'public') # 'outside' is not allowed
 
     @safe.nfs.create_file(
       path,
       "\n", # SAFE bug!!!
       root_path: 'drive',
-      is_private: root_is_public
+      is_private: root_type == 'private'
     )
   end
 
@@ -224,12 +287,20 @@ class SafeVFS
     name = folders.pop
     return true if folders.empty? # /, /public, /private
 
-    root_is_public = (folders.shift == 'public')
+    root_type = folders.shift
     path = '/' + folders.join('/') # relative to /public or /private
 
     # Cache
-    entries = root_is_public ? $cached_public.find_folder(path) : $cached_private.find_folder(path)
-    contents("/#{root_is_public ? 'public' : 'private'}/#{path}") if ! entries[:valid]
+    cached = case root_type
+    when 'public' then $cached_public
+    when 'private' then $cached_private
+    when 'outside' then $cached_alien
+    else raise Errno::EBADF
+    end
+
+    # Cache
+    entries = cached.find_folder(path)
+    contents("/#{root_type}/#{path}") if ! entries[:valid]
     hash_name = Digest::SHA2.new(256).hexdigest(name)
     return entries[:folders].key?(hash_name)
   end
@@ -251,15 +322,40 @@ class SafeVFS
     folders.shift # 1st item is always blank
     name = folders.pop
 
-    root_is_public = (folders.shift == 'public')
+    root_type = folders.shift
     path = '/' + folders.join('/') # relative to /public or /private
     path = path + '/' if folders.any?
 
+    # Cache
+    cached = case root_type
+    when 'public' then $cached_public
+    when 'private' then $cached_private
+    when 'outside' then $cached_alien
+    else raise Errno::EBADF
+    end
+
     path = path + name
-    @safe.nfs.create_directory(path, root_path: 'drive', is_private: ! root_is_public)
+    if root_type == 'outside'
+      raise Errno::EPERM if folders.any? # you can only create dirs at /outside, not on its subfolders
+
+      # domain exists?
+      domain_items = name.split('.')
+      if @safe.dns.get_home_dir(domain_items[1], domain_items[0])['errorCode']
+        raise Errno::ENOENT
+      end
+
+      @settings["alien_items"] << name
+      @safe.nfs.delete_file('settings.json', root_path: 'app', is_private: true)
+      @safe.nfs.create_file('settings.json', @settings.to_json, root_path: 'app', is_private: true)
+      @settings = @safe.nfs.get_file('settings.json', root_path: 'app', is_private: true)['body']
+      @settings = JSON.parse(@settings)
+      contents("/#{root_type}#{path}")
+    else
+      @safe.nfs.create_directory(path, root_path: 'drive', is_private: root_type == 'private')
+    end
 
     # invalidates cache
-    entries = root_is_public ? $cached_public.find_folder(path) : $cached_private.find_folder(path)
+    entries = cached.find_folder(path)
     entries[:valid] = false
 
     true
@@ -272,18 +368,35 @@ class SafeVFS
     folders.shift # 1st item is always blank
     name = folders.pop
 
-    root_is_public = (folders.shift == 'public')
+    root_type = folders.shift
     path = '/' + folders.join('/') # relative to /public or /private
     path = path + '/' if folders.any?
 
     path = path + name
 
-    # CANNOT destroy if there are files inside
-    entries = root_is_public ? $cached_public.find_folder(path) : $cached_private.find_folder(path)
-    contents("/#{root_is_public ? 'public' : 'private'}/#{path}") if ! entries[:valid]
-    raise Errno::ENOTEMPTY if entries[:files].any?
+    # Cache
+    cached = case root_type
+    when 'public' then $cached_public
+    when 'private' then $cached_private
+    when 'outside' then $cached_alien
+    else raise Errno::EBADF
+    end
 
-    @safe.nfs.delete_directory(path, root_path: 'drive', is_private: ! root_is_public)
+    if root_type == 'outside'
+      # remove from settings.json
+      @settings["alien_items"] = @settings["alien_items"] - [name]
+      @safe.nfs.delete_file('settings.json', root_path: 'app', is_private: true)
+      @safe.nfs.create_file('settings.json', @settings.to_json, root_path: 'app', is_private: true)
+      @settings = @safe.nfs.get_file('settings.json', root_path: 'app', is_private: true)['body']
+      @settings = JSON.parse(@settings)
+    else
+      # CANNOT destroy if there are files inside
+      entries = cached.find_folder(path)
+      contents("/#{root_type}/#{path}") if ! entries[:valid]
+      raise Errno::ENOTEMPTY if entries[:files].any?
+
+      @safe.nfs.delete_directory(path, root_path: 'drive', is_private: root_type == 'private')
+    end
 
     # invalidates cache
     entries[:valid] = false
@@ -318,8 +431,19 @@ class SafeVFS
     folders.shift # 1st item is always blank
     name = folders.pop
 
-    root_is_public = (folders.shift == 'public')
+    root_type = folders.shift
     path = '/' + folders.join('/') # relative to /public or /private
+
+    # read-only mode "/outside"
+    raise Errno::EPERM if (root_type == 'outside') && ['w', 'rw', 'a'].include?(mode)
+
+    # long_name, service_name
+    if root_type == 'outside'
+      domain = folders.shift
+      domain_items = domain.split('.')
+      raise Errno::EBADF if domain_items.length != 2 # Bad format
+      path = '/' + folders.join('/') # relative to /public or /private
+    end
 
     # Write mode: SAFE lacks support for updating files
     #  Workaround: save contents in a local temp file and send it to the
@@ -331,8 +455,10 @@ class SafeVFS
       path: path,
       mode: mode,
       name: name,
-      root_is_public: root_is_public,
+      root_type: root_type,
       tmp_hnd: tmp_hnd,
+      service_name: domain_items[0],
+      long_name: domain_items[1],
       contents_changed: false,
       contents_loaded: false # for rw mode, we need to load the entire file if we want to change it
     }
@@ -341,11 +467,19 @@ class SafeVFS
   def raw_read(path, offset, size, raw)
     # offset / length not implemented yet on SAFE
     if ! raw[:contents_loaded]
-      file = @safe.nfs.get_file(
-        [raw[:path], raw[:name]].join('/'),
-        root_path: 'drive',
-        is_private: raw[:root_is_public]
-      )
+      file = if raw[:root_type] == 'outside'
+        @safe.dns.get_file_unauth(
+          raw[:long_name],
+          raw[:service_name],
+          [raw[:path], raw[:name]].join('/')
+        )
+      else
+        @safe.nfs.get_file(
+          [raw[:path], raw[:name]].join('/'),
+          root_path: 'drive',
+          is_private: raw[:root_type] == 'private'
+        )
+      end
       raise Errno::ENOENT if file['body'].nil?
 
       raw[:tmp_hnd].seek(0)
@@ -366,7 +500,7 @@ class SafeVFS
       file = @safe.nfs.get_file(
         [raw[:path], raw[:name]].join('/'),
         root_path: 'drive',
-        is_private: raw[:root_is_public]
+        is_private: raw[:root_type] == 'private'
       )
       raw[:tmp_hnd].seek(0)
       raw[:tmp_hnd].write(file['body']) if file['body']
@@ -380,16 +514,24 @@ class SafeVFS
   def raw_close(path, raw)
     # write mode, create file if necessary, freed resources
     if raw[:tmp_hnd] && raw[:contents_changed]
-      @safe.nfs.delete_file([raw[:path], raw[:name]].join('/'), root_path: 'drive', is_private: raw[:root_is_public])
+      @safe.nfs.delete_file([raw[:path], raw[:name]].join('/'), root_path: 'drive', is_private: raw[:root_type] == 'private')
       raw[:tmp_hnd].seek(0)
       contents = raw[:tmp_hnd].read
       contents ||= "\n" # SAFE bug
-      @safe.nfs.create_file([raw[:path], raw[:name]].join('/'), contents, root_path: 'drive', is_private: raw[:root_is_public])
+      @safe.nfs.create_file([raw[:path], raw[:name]].join('/'), contents, root_path: 'drive', is_private: raw[:root_type] == 'private')
+
+      # Cache
+      cached = case raw[:root_type]
+      when 'public' then $cached_public
+      when 'private' then $cached_private
+      when 'outside' then $cached_alien
+      else raise Errno::EBADF
+      end
 
       # invalidates cache
-      entries = raw[:root_is_public] ? $cached_public.find_folder(raw[:path]) : $cached_private.find_folder(raw[:path])
+      entries = cached.find_folder(raw[:path])
       entries[:valid] = false
-      contents("/#{raw[:root_is_public] ? 'public' : 'private'}#{raw[:path]}")
+      contents("/#{raw[:root_type]}#{raw[:path]}")
     end
 
     if raw[:tmp_hnd]
@@ -407,5 +549,5 @@ end
 
 safe_vfs = SafeVFS.new
 # safe_vfs.contents('/')
-# FuseFS.start(safe_vfs, '/mnt/test')
-FuseFS.main() { |opt| safe_vfs }
+FuseFS.start(safe_vfs, '/mnt/test')
+# FuseFS.main() { |opt| safe_vfs }
