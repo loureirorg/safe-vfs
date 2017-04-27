@@ -4,6 +4,8 @@ require 'tempfile'
 require 'digest'
 require 'date'
 
+VERSION = 1.4.0
+
 class CacheTree
   def initialize
     # "Invalid" means cache needs to be updated
@@ -138,6 +140,8 @@ class SafeVFS
           raise Errno::EPERM # we cannot read subfolders
         end
       end
+
+    # /public or /private
     else
       root_is_public = (root_type == 'public')
 
@@ -157,8 +161,8 @@ class SafeVFS
       cache[:files] = {}
 
       # files
+      cache = safe_res['info']['isPrivate'] ? $cached_private : $cached_public
       safe_res['files'].each do |item|
-        cache = item['isPrivate'] ? $cached_private : $cached_public
         cache.put(true, path, item['name'], item)
       end
 
@@ -456,6 +460,9 @@ class SafeVFS
     # read-only mode "/outside"
     raise Errno::EPERM if (root_type == 'outside') && ['w', 'rw', 'a'].include?(mode)
 
+    # root of "/public" is for folders only (not files)
+    raise Errno::EPERM if (root_type == 'public') && ['w', 'rw', 'a'].include?(mode) && (path == '/')
+
     # long_name, service_name
     domain_items = []
     if root_type == 'outside'
@@ -569,5 +576,5 @@ end
 
 safe_vfs = SafeVFS.new
 # safe_vfs.contents('/')
-FuseFS.start(safe_vfs, '/home/daniel/safe-disk')
-# FuseFS.main() { |opt| safe_vfs }
+# FuseFS.start(safe_vfs, '/home/daniel/safe-disk')
+FuseFS.main() { |opt| safe_vfs }
