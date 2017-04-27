@@ -10,7 +10,7 @@ GEM
     rfuse (1.1.2)
     rfusefs (1.0.3)
       rfuse (~> 1.1)
-    ruby-safenet (0.5.5)
+    ruby-safenet (0.5.6)
     slop (3.6.0)
 
 PLATFORMS
@@ -22,4 +22,4 @@ DEPENDENCIES
   ruby-safenet!
 
 BUNDLED WITH
-   1.11.2
+   1.14.6

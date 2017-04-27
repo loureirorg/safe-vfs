@@ -146,6 +146,7 @@ class SafeVFS
       #  For a /public  emulation, it checks on "/" for isPrivate=false items
       #  For a /private emulation, it checks on "/" for isPrivate=true  items
       safe_res = @safe.nfs.get_directory(path, root_path: 'drive')
+      return [] if safe_res['errorCode']
 
       # invalidates cache
       cache = $cached_private.find_folder(path)
@@ -243,6 +244,24 @@ class SafeVFS
 
     @safe.nfs.move_file('drive', from_path, 'drive', to_path, 'move')
     @safe.nfs.update_file_meta([to_path, name_from].join('/'), root_path: 'drive', name: name_to) if name_to != name_from
+    @safe.nfs.update_directory([to_path, name_from].join('/'), root_path: 'drive', name: name_to) if name_to != name_from
+
+    # Cache
+    cached = case priv_pub_from
+    when 'public' then $cached_public
+    when 'private' then $cached_private
+    when 'outside' then $cached_alien
+    else raise Errno::EBADF
+    end
+
+    # invalidates cache
+    entries = cached.find_folder("/#{priv_pub_from}/#{from_path}")
+    entries[:valid] = false
+
+    contents("/#{priv_pub_from}/#{from_path}")
+    contents("/#{priv_pub_to}/#{to_path}")
+
+    true
   end
 
   def touch(path, modtime)
@@ -550,5 +569,5 @@ end
 
 safe_vfs = SafeVFS.new
 # safe_vfs.contents('/')
-# FuseFS.start(safe_vfs, '/mnt/test')
-FuseFS.main() { |opt| safe_vfs }
+FuseFS.start(safe_vfs, '/home/daniel/safe-disk')
+# FuseFS.main() { |opt| safe_vfs }
