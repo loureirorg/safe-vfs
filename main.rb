@@ -4,7 +4,7 @@ require 'tempfile'
 require 'digest'
 require 'date'
 
-VERSION = 1.4.0
+VERSION = "1.4.0"
 
 class CacheTree
   def initialize
