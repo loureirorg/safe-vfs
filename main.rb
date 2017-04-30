@@ -156,14 +156,14 @@ class SafeVFS
       permissions: ['SAFE_DRIVE_ACCESS']
     })
 
-    @safe.nfs.delete_file('settings.json', root_path: 'app', is_private: true)
-    @settings = @safe.nfs.get_file('settings.json', root_path: 'app', is_private: true)['body']
+    @safe.nfs.delete_file('settings.json', root_path: 'app')
+    @settings = @safe.nfs.get_file('settings.json', root_path: 'app')['body']
     if @settings.nil?
       default_structure = {
         alien_items: []
       }
-      @safe.nfs.create_file('settings.json', default_structure.to_json, root_path: 'app', is_private: true)
-      @settings = @safe.nfs.get_file('settings.json', root_path: 'app', is_private: true)['body']
+      @safe.nfs.create_file('settings.json', default_structure.to_json, root_path: 'app')
+      @settings = @safe.nfs.get_file('settings.json', root_path: 'app')['body']
     end
     @settings = JSON.parse(@settings)
   end
@@ -512,21 +512,17 @@ class SafeVFS
   end
 
   def mkdir(path)
-    raise Errno::EPERM if path == '/'
+    # puts "mkdir: #{path}"
+    raise Errno::EPERM.new('You cannot create items in the root') if path == '/'
 
-    folders = path.split('/')
-    folders.shift # 1st item is always blank
-    name = folders.pop
+    # path items
+    root_type, path = split_path(path)
+    path_items = scan_path(path)
+    name = path_items.pop
+    path = '/' + path_items.join('/')
 
-    root_type = folders.shift
-    path = '/' + folders.join('/') # relative to /public or /private
-    path = path + '/' if folders.any?
-
-    # Cache
-    cached = cache(root_type)
-
-    path = path + name
-    if root_type == 'others'
+    case root_type
+    when 'others'
       raise Errno::EPERM if folders.any? # you can only create dirs at /others, not on its subfolders
 
       # domain exists?
@@ -536,18 +532,32 @@ class SafeVFS
       end
 
       @settings["alien_items"] << name
-      @safe.nfs.delete_file('settings.json', root_path: 'app', is_private: true)
-      @safe.nfs.create_file('settings.json', @settings.to_json, root_path: 'app', is_private: true)
-      @settings = @safe.nfs.get_file('settings.json', root_path: 'app', is_private: true)['body']
+      @safe.nfs.delete_file('settings.json', root_path: 'app')
+      @safe.nfs.create_file('settings.json', @settings.to_json, root_path: 'app')
+      @settings = @safe.nfs.get_file('settings.json', root_path: 'app')['body']
       @settings = JSON.parse(@settings)
-      contents("/#{root_type}#{path}")
+
+    when 'dns'
+      # need to be in the root of /dns
+      raise Errno::EPERM.new('You can create domains in the root') if path_items.length != 0
+
+      # no spaces allowed
+      raise Errno::EPERM.new('No spaces allowed') if name.index(' ')
+
+      @safe.dns.create_long_name(name)
+
+    when 'public', 'private'
+      @safe.nfs.create_directory("#{path}/#{name}".squeeze('/'), root_path: root_type == 'public' ? 'app' : 'drive', is_private: root_type == 'private')
+
     else
-      @safe.nfs.create_directory(path, root_path: root_type == 'public' ? 'app' : 'drive', is_private: root_type == 'private')
+      raise Errno::EBADF
     end
 
     # invalidates cache
+    cached = cache(root_type)
     entries = cached.find_folder(path)
     entries[:valid] = false
+    contents("/#{root_type}/#{path}".squeeze('/'))
 
     true
   end
