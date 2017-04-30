@@ -4,7 +4,8 @@ require 'tempfile'
 require 'digest'
 require 'date'
 
-VERSION = "0.2.0"
+VERSION        = "0.5.0"
+EMPTY_CONTENTS = "\004\n" # SAFE bug
 
 module RFuse
   class Stat
@@ -203,10 +204,6 @@ class SafeVFS
 
     case root_type
     when 'dns'
-      # puts 'DNS'
-      # puts "path: #{path}"
-      # puts "folders: #{folders.join('.')}"
-      # invalidates cache
       cache = $cached_alien.find_folder(path)
       cache[:folders] = {}
       cache[:files] = {}
@@ -226,8 +223,10 @@ class SafeVFS
         items.each do |item|
           $cached_dns.put('symlink', "/#{name}", item, {'name' => item, 'size' => "#{PWD}/public/#{item}".length})
         end
+        contents("/public/")
         return items
       end
+
     when 'others'
       if folders.empty? # root, ie. "ls /others"
         return @settings["alien_items"]
@@ -301,6 +300,12 @@ class SafeVFS
           end
           cache.put('symlink', path, item['name'], item)
         else
+          meta = nil
+          begin
+            meta = Base64.strict_decode64(item['metadata'])
+          rescue
+          end
+          item['size'] = 0 if meta == 'EMPTY_FILE'
           cache.put('file', path, item['name'], item)
         end
       end
@@ -444,7 +449,7 @@ class SafeVFS
 
     @safe.nfs.create_file(
       path,
-      "\n", # SAFE bug!!!
+      EMPTY_CONTENTS, # SAFE bug!!!
       root_path: root_type == 'public' ? 'app' : 'drive',
       is_private: root_type == 'private'
     )
@@ -616,7 +621,7 @@ class SafeVFS
       name = root_type == 'public' ? ".SAFE_SYMLINK_PUBLIC.#{name}" : ".SAFE_SYMLINK.#{name}"
     end
 
-    @safe.nfs.delete_file("#{path}/#{name}".squeeze('/'), root_path: root_type == 'public' ? 'app' : 'drive', is_private: root_type == 'private')
+    @safe.nfs.delete_file("#{path}/#{name}".squeeze('/'), root_path: root_type == 'public' ? 'app' : 'drive')
   end
 
   def raw_open(path, mode, raw=nil)
@@ -679,12 +684,12 @@ class SafeVFS
       else
         @safe.nfs.get_file(
           [raw[:path], raw[:name]].join('/'),
-          root_path: 'drive',
-          is_private: raw[:root_type] == 'private'
+          root_path: raw[:root_type] == 'public' ? 'app' : 'drive'
         )
       end
       raise Errno::ENOENT if file['body'].nil?
 
+      file["body"] = "" if file["body"] == EMPTY_CONTENTS # API bug
       raw[:tmp_hnd].seek(0)
       raw[:tmp_hnd].write(file["body"]) if file['body']
       raw[:contents_loaded] = true
@@ -695,16 +700,15 @@ class SafeVFS
   end
 
   def raw_write(path, offset, size, buffer, raw)
-    # puts "raw_write: #{path}"
-    raise Errno::EPERM if ! ['w', 'rw', 'a'].include?(raw[:mode]) # read-only mode
+    # puts "raw_write: #{path} #{raw[:mode]}"
+    raise Errno::EPERM if ! raw[:mode] =~ /[aw]/  # read-only mode
 
     # write and read mode, we need load the file
     if (raw[:mode] == 'rw' || raw[:mode] == 'a') && (raw[:contents_loaded] == false)
       raw[:contents_loaded] = true
       file = @safe.nfs.get_file(
         [raw[:path], raw[:name]].join('/'),
-        root_path: 'drive',
-        is_private: raw[:root_type] == 'private'
+        root_path: raw[:root_type] == 'public' ? 'app' : 'drive'
       )
       raw[:tmp_hnd].seek(0)
       raw[:tmp_hnd].write(file['body']) if file['body']
@@ -719,11 +723,11 @@ class SafeVFS
     # puts "raw_close: #{path}"
     # write mode, create file if necessary, freed resources
     if raw[:tmp_hnd] && raw[:contents_changed]
-      @safe.nfs.delete_file([raw[:path], raw[:name]].join('/'), root_path: 'drive')
+      @safe.nfs.delete_file([raw[:path], raw[:name]].join('/'), root_path: raw[:root_type] == 'public' ? 'app' : 'drive')
       raw[:tmp_hnd].seek(0)
       contents = raw[:tmp_hnd].read
-      contents ||= "\n" # SAFE bug
-      @safe.nfs.create_file([raw[:path], raw[:name]].join('/'), contents, root_path: 'drive')
+      contents ||= EMPTY_CONTENTS # SAFE bug
+      @safe.nfs.create_file([raw[:path], raw[:name]].join('/'), contents, root_path: raw[:root_type] == 'public' ? 'app' : 'drive')
 
       # invalidates cache
       cached = cache(raw[:root_type])
@@ -734,8 +738,8 @@ class SafeVFS
     elsif raw[:tmp_hnd]
       contents = raw[:tmp_hnd].read
       if contents.empty? # SAFE bug
-        contents = "\n"
-        @safe.nfs.create_file([raw[:path], raw[:name]].join('/'), contents, root_path: 'drive')
+        contents = EMPTY_CONTENTS
+        @safe.nfs.create_file([raw[:path], raw[:name]].join('/'), contents, root_path: raw[:root_type] == 'public' ? 'app' : 'drive', meta: 'EMPTY_FILE')
 
         # invalidates cache
         cached = cache(raw[:root_type])
@@ -753,21 +757,39 @@ class SafeVFS
   def symlink(from, to)
     # puts "SYMLINK #{from} -> #{to} #{PWD}"
     from = from[PWD.length..-1] # absolute path
-    root_type, to = split_path(to)
-    raise Errno::EPERM if ! ['public', 'private', 'dns'].include?(root_type)
+    to_root_type, to = split_path(to)
+    from_root_type, from = split_path(from)
+    raise Errno::EPERM if ! ['public', 'private', 'dns'].include?(to_root_type)
 
     path_items = scan_path(to)
     name = path_items.pop
     path = '/' + path_items.join('/')
 
+    # from /public to /dns
+    if (from_root_type == 'public') && (to_root_type == 'dns')
+      # need to be inside a subfolder in /dns
+      raise Errno::EPERM.new('You can only save symlinks in a folder') if path_items.length != 1
+
+      long_name    = path_items.first
+      service_name = name
+      home_dir     = from
+      @safe.dns.add_service(long_name, service_name, home_dir)
+
+      return true
+    end
+
+    raise Errno::EPERM if ! to_root_type != from_root_type
+
     # save on network
-    link_name = root_type == 'public' ? ".SAFE_SYMLINK_PUBLIC.#{name}" : ".SAFE_SYMLINK.#{name}"
-    @safe.nfs.create_file(link_name, from, root_path: root_type == 'public' ? 'app' : 'drive', is_private: root_type == 'private')
+    link_name = to_root_type == 'public' ? ".SAFE_SYMLINK_PUBLIC.#{name}" : ".SAFE_SYMLINK.#{name}"
+    @safe.nfs.create_file(link_name, "#{from_root_type}/#{from}".squeeze('/'), root_path: to_root_type == 'public' ? 'app' : 'drive')
 
     # save on cache
-    cached = cache(root_type)
+    cached = cache(to_root_type)
     entries = cached.find_folder(path)
     entries[:valid] = false
+
+    return true
   end
 
   def readlink(path, size)
@@ -797,8 +819,9 @@ class SafeVFS
 end
 
 safe_vfs = SafeVFS.new
-# safe_vfs.contents('/')
+
 # PWD = '/home/daniel/safe-disk'
 # FuseFS.start(safe_vfs, '/home/daniel/safe-disk')
+
 PWD = ARGV[0]
 FuseFS.main() { |opt| safe_vfs }
