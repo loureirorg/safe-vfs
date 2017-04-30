@@ -766,6 +766,12 @@ class SafeVFS
 
   def symlink(from, to)
     # puts "SYMLINK #{from} -> #{to} #{PWD}"
+    if (from[0] == '.') || (from[0] == '~')
+      from = File.absolute_path
+    elsif from[0] != '/'
+      from = "#{PWD}/#{from}"
+    end
+
     from = from[PWD.length..-1] # absolute path
     to_root_type, to = split_path(to)
     from_root_type, from = split_path(from)
